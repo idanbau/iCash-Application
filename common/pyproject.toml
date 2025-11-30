@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "icash-common"
+version = "0.1.2"
+description = "Common code for iCash services"
+authors = [{ name = "Idan" }]
+dependencies = []
+
+[tool.setuptools]
+packages = ["icash_common"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+icash_common = [
+    "templates/*.html",
+    "static/*"
+]

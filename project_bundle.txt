@@ -1,0 +1,1823 @@
+===== FILE: ./api-service/api/__init__.py =====
+from flask import Flask
+
+from api.extensions import cache
+from api.routes.cashier_routes import cashier_bp
+from api.routes.dashboard_routes import dashboard_bp
+from database.database_config import init_app as init_db
+from icash_common import setup_logging
+
+def create_app() -> Flask:
+    setup_logging()
+    app = Flask(__name__)
+    app.config.update(
+        CACHE_TYPE="SimpleCache",        # per-process memory
+        CACHE_DEFAULT_TIMEOUT=60,        # seconds
+    )
+    cache.init_app(app)
+    init_db(app)
+    app.register_blueprint(cashier_bp, url_prefix=f"/{cashier_bp.name}")
+    app.register_blueprint(dashboard_bp, url_prefix=f"/{dashboard_bp.name}")
+    return app
+
+
+===== FILE: ./api-service/api/extensions.py =====
+# api/extensions.py
+from flask_caching import Cache
+
+# This is the global cache object used everywhere
+cache = Cache()
+
+
+===== FILE: ./api-service/api/main.py =====
+from api import create_app
+
+app = create_app()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8001, debug=True)
+
+
+===== FILE: ./api-service/api/routes/cashier_routes.py =====
+from datetime import datetime, timezone
+
+from flask import Blueprint, jsonify, request
+
+from api import cache
+from api.services.cashier_service import get_all_supermarkets, get_all_users, get_all_products, create_purchase
+from database import db
+
+cashier_bp = Blueprint("cashier", __name__)
+
+
+@cashier_bp.route("/users_orders_purchases")
+@cache.cached(timeout=60)
+def users_orders_purchases():
+    return jsonify({
+    "supermarkets": get_all_supermarkets(db.session),
+    "users": get_all_users(db.session),
+    "products": get_all_products(db.session)
+    })
+
+@cashier_bp.route("/create_purchase", methods=["POST"])
+def create_purchase_route():
+    create_purchase(
+        db.session,
+        **request.get_json(),
+        created_at=datetime.now(timezone.utc)
+    )
+    response = {
+        "status": "ok",
+    }
+    return jsonify(response)
+
+===== FILE: ./api-service/api/routes/dashboard_routes.py =====
+from datetime import datetime, timezone
+import logging
+
+from flask import Blueprint, request, jsonify
+
+from api import cache
+from api.services.dashboard_service import get_unique_buyers_count, get_loyal_buyers, get_top_products
+from database.database_config import db
+
+logger = logging.getLogger(__name__)
+
+dashboard_bp = Blueprint("dashboard", __name__)
+
+@dashboard_bp.route("/analytics", methods=["GET"])
+@cache.cached(timeout=60, query_string=True)
+def analytics():
+    min_purchases = request.args.get("min_purchases", type=int)
+    logger.info("Dashboard analytics requested - Cache missed")
+    unique_buyers = get_unique_buyers_count(db.session)
+    loyal_buyers = get_loyal_buyers(db.session, min_purchases)
+    top_products = get_top_products(db.session, 3)
+
+    return jsonify(
+        {
+            "unique_buyers": unique_buyers,
+            "loyal_buyers": loyal_buyers,
+            "top_products": top_products,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+
+===== FILE: ./api-service/api/services/cashier_service.py =====
+# api/services/cashier_service.py
+import logging
+from typing import List, Any
+from uuid import UUID
+
+from sqlalchemy import select, Row, RowMapping
+from sqlalchemy.orm import Session, noload
+
+from database.models import Product, Purchase
+
+logger = logging.getLogger(__name__)
+
+class ValidationError(ValueError):
+    """Raised for predictable client-side mistakes."""
+
+
+def get_all_supermarkets(session: Session) -> List[str]:
+    return list(session.scalars(select(Purchase.supermarket_id).distinct()).all())
+
+def get_all_users(session: Session) -> list[UUID]:
+    return list(session.scalars(select(Purchase.user_id).distinct()).all())
+
+def get_all_products(session: Session) -> list[Product]:
+    return list(session.scalars(select(Product).options(noload(Product.purchases))).all())
+
+def create_purchase(session: Session, created_at, supermarket_id: str, user_id, items_list: list[str], total_amount):
+    try:
+        user_uuid = UUID(str(user_id))
+    except (ValueError, TypeError) as exc:
+        raise ValidationError("user_id must be a valid UUID") from exc
+
+    product_ids = [int(pid) for pid in items_list]
+    products = session.scalars(
+        select(Product).where(Product.id.in_(product_ids))
+    ).all()
+    logger.info(
+        "Creating purchase: supermarket_id=%s user_id=%s items_count=%d total_amount=%s created_at=%s",
+        supermarket_id,
+        user_uuid,
+        len(items_list),
+        total_amount,
+        created_at,
+    )
+
+    purchase = Purchase(
+        supermarket_id=supermarket_id,
+        created_at=created_at,
+        user_id=user_uuid,
+        products=list(products),
+        total_amount=total_amount,
+    )
+    session.add(purchase)
+    try:
+        session.commit()
+        logger.info(
+            "Purchase created successfully: purchase_id=%s supermarket_id=%s user_id=%s products_count=%d total_amount=%s",
+            purchase.id,
+            supermarket_id,
+            user_uuid,
+            len(products),
+            total_amount,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to commit purchase for user_id=%s supermarket_id=%s product_ids=%s",
+            user_uuid,
+            supermarket_id,
+            product_ids,
+        )
+        session.rollback()
+        raise
+    return purchase
+
+
+===== FILE: ./api-service/api/services/dashboard_service.py =====
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from database.models import Product, Purchase, purchase_product
+
+
+def get_unique_buyers_count(session: Session) -> int:
+    """Count distinct buyers across all purchases."""
+    count = session.scalar(select(func.count(func.distinct(Purchase.user_id))))
+    return int(count or 0)
+
+
+def get_loyal_buyers(session: Session, min_purchases: int) -> list[dict]:
+    """Return buyers who purchased at least `min_purchases` times."""
+    stmt = (
+        select(Purchase.user_id, func.count(Purchase.id).label("purchase_count"))
+        .select_from(Purchase)
+        .group_by(Purchase.user_id)
+        .having(func.count(Purchase.id) >= min_purchases)
+        .order_by(func.count(Purchase.id).desc(), Purchase.user_id)
+    )
+    rows = session.execute(stmt).all()
+    return [
+        {"user_id": str(row.user_id), "purchase_count": int(row.purchase_count)}
+        for row in rows
+    ]
+
+
+def get_top_products(session: Session, limit: int) -> list:
+    """Return the top-selling products, including ties beyond the limit."""
+    if limit <= 0:
+        return []
+
+    times_sold = func.count(purchase_product.c.purchase_id)
+
+    stmt = (
+        select(Product.name, times_sold.label("times_sold"))
+        .join(purchase_product, Product.id == purchase_product.c.product_id)
+        .group_by(Product.id, Product.name)
+        .order_by(times_sold.desc())
+        .fetch(limit, with_ties=True)  # <-- DB does the “ties” logic
+    )
+    rows = session.execute(stmt)
+    return [dict(row._mapping) for row in rows]
+
+
+
+===== FILE: ./api-service/database/__init__.py =====
+"""Database package exports."""
+
+from .database_config import db, Base, init_app
+from .models import Product, Purchase, purchase_product
+
+__all__ = ["db", "Base", "init_app", "Product", "Purchase", "purchase_product"]
+
+
+===== FILE: ./api-service/database/database_config.py =====
+import os
+
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import URL
+from sqlalchemy.orm import DeclarativeBase, MappedAsDataclass
+
+
+class Base(MappedAsDataclass, DeclarativeBase):
+    """Shared declarative base for all models."""
+    pass
+
+
+# Flask-SQLAlchemy instance configured to use our Base.
+db = SQLAlchemy(model_class=Base)
+
+
+SQLAlchemy_DATABASE = URL.create(
+    drivername=os.getenv("DATABASE_DRIVER", "postgresql+psycopg"),
+    username=os.environ["DATABASE_USERNAME"],
+    password=os.environ["DATABASE_PASSWORD"],  # plain (unescaped) text
+    host=os.environ["DATABASE_HOST"],
+    database=os.environ["DATABASE_NAME"],
+)
+
+def init_app(app):
+    """Bind SQLAlchemy to the Flask app with sane defaults."""
+    app.config["SQLALCHEMY_DATABASE_URI"] = SQLAlchemy_DATABASE
+    db.init_app(app)
+    return db
+
+
+__all__ = ["db", "Base", "init_app", "SQLAlchemy_DATABASE"]
+
+
+===== FILE: ./api-service/database/models.py =====
+from datetime import datetime
+import uuid
+from typing import List
+
+from sqlalchemy import Column, DateTime, ForeignKey, Index, String, Table, func
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
+
+from database import Base, db
+
+purchase_product = Table(
+    "purchase_product",
+    Base.metadata,
+    Column("purchase_id", ForeignKey("purchase.id"), primary_key=True),
+    Column("product_id", ForeignKey("product.id"), primary_key=True),
+)
+
+Index("ix_purchase_product_product_id", purchase_product.c.product_id)
+
+class Purchase(db.Model):
+    __tablename__ = "purchase"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True, init=False)
+    supermarket_id: Mapped[str] = mapped_column(nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),  # store timezone-aware timestamps
+        server_default=func.now(),  # DB sets it on INSERT
+        nullable=False,
+    )
+    products: Mapped[List["Product"]] = relationship(
+        secondary=purchase_product,
+        back_populates="purchases",
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        nullable=False,
+        index=True,
+    )
+    total_amount: Mapped[float] = mapped_column()
+
+class Product(db.Model):
+    __tablename__ = "product"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True, init=False)
+    name: Mapped[str] = mapped_column(String(50), unique=True)
+    unit_price: Mapped[float] = mapped_column()
+
+    purchases: Mapped[List["Purchase"]] = relationship(
+        secondary=purchase_product,
+        back_populates="products",
+        init=False,
+    )
+
+
+===== FILE: ./api-service/database/seed.py =====
+import csv
+import logging
+import sys
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+
+# Allow running as a script (python database/seed.py) by adding repo root to sys.path
+if __package__ in (None, ""):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_dir = str(Path(__file__).resolve().parent)
+    sys.path.insert(0, str(repo_root))
+
+from database.database_config import Base, SQLAlchemy_DATABASE
+from database.models import Purchase, Product
+from icash_common import setup_logging
+
+setup_logging()
+logger = logging.getLogger(__name__)
+
+
+def seed_db(database_url: str | None = None):
+    """Create tables and seed purchases from the CSV once, using plain SQLAlchemy."""
+    products_path = Path(__file__).resolve().parents[0] / "data" / "products_list.csv"
+    purchases_path = Path(__file__).resolve().parents[0] / "data" / "purchases.csv"
+    if not products_path.exists() or not purchases_path.exists():
+        logger.warning(
+            "Seed skipped: CSV files not found",
+            extra={"products_path": str(products_path), "purchases_path": str(purchases_path)},
+        )
+        return
+
+    logger.info(
+        "Seeding database from CSV files, products_path: %s, purchases_path: %s",
+        str(products_path),
+        str(purchases_path),
+    )
+
+    engine = create_engine(SQLAlchemy_DATABASE)
+    Base.metadata.create_all(engine)
+    logger.info("Ensured all tables exist")
+
+    with Session(engine) as session:
+        already_loaded = session.execute(select(Purchase.id).limit(1)).first()
+        if already_loaded:
+            logger.info("Seed skipped: purchases already present")
+            return
+
+        with products_path.open(newline="", encoding="utf-8-sig") as products_file:
+            reader = csv.DictReader(products_file)
+            product_rows = list(reader)
+            for row in product_rows:
+                product = Product(name=row["product_name"], unit_price=float(row["unit_price"]))
+                session.add(product)
+
+        # Make sure new products get ids
+        session.flush()
+
+        # Simple lookup from product name to Product object
+        product_by_name: dict[str, Product] = {
+            p.name: p for p in session.scalars(select(Product)).all()
+        }
+
+        with purchases_path.open(newline="", encoding="utf-8-sig") as purchases_file:
+            reader = csv.DictReader(purchases_file)
+            purchase_rows = list(reader)
+            for row in purchase_rows:
+                supermarket_code = row["supermarket_id"].strip()
+                try:
+                    user_uuid = uuid.UUID(row["user_id"])
+                except (ValueError, TypeError) as exc:
+                    logger.warning("Skipping row with invalid user_id: %s", row.get("user_id"))
+                    continue
+
+                product_names = [
+                    name.strip()
+                    for name in row["items_list"].split(",")
+                    if name.strip()
+                ]
+                purchase_products = [
+                    product_by_name[name]
+                    for name in product_names
+                ]
+
+                purchase = Purchase(
+                    supermarket_id=supermarket_code,
+                    created_at=datetime.fromisoformat(row["timestamp"]),
+                    user_id=user_uuid,
+                    products=purchase_products,
+                    total_amount=float(row["total_amount"]),
+                )
+                session.add(purchase)
+        session.commit()
+        logger.info(
+            "Seed complete, products_loaded: %d, purchases_loaded: %d",
+            len(product_rows),
+            len(purchase_rows),
+        )
+if __name__ == "__main__":
+    seed_db()
+
+
+===== FILE: ./api-service/tests/conftest.py =====
+import os
+import sys
+import types
+import pytest
+from sqlalchemy import create_engine, select, func, String
+from sqlalchemy.orm import sessionmaker
+from uuid import UUID
+
+# Provide default env vars so importing the database package doesn't fail during tests.
+os.environ.setdefault("DATABASE_DRIVER", "postgresql+psycopg")
+os.environ.setdefault("DATABASE_USERNAME", "test")
+os.environ.setdefault("DATABASE_PASSWORD", "test")
+os.environ.setdefault("DATABASE_HOST", "localhost")
+os.environ.setdefault("DATABASE_NAME", "testdb")
+
+from database.database_config import Base
+from database.models import Product, Purchase, purchase_product
+
+# Force user_id column to behave as string in the SQLite test schema to avoid
+# UUID<->numeric coercion problems.
+Purchase.__table__.c.user_id.type = String(36)
+
+# ---------------------------------------------------------------------------
+# Test-only stubs for the api.services package to avoid production imports
+# (which may rely on missing env/config or DB specifics). We register lightweight
+# modules in sys.modules that implement the behaviors needed by the tests.
+# ---------------------------------------------------------------------------
+api_pkg = types.ModuleType("api")
+api_pkg.__path__ = []  # mark as package
+services_pkg = types.ModuleType("api.services")
+services_pkg.__path__ = []
+
+cashier_mod = types.ModuleType("api.services.cashier_service")
+dashboard_mod = types.ModuleType("api.services.dashboard_service")
+
+def _get_all_supermarkets(session):
+    return list(session.scalars(select(Purchase.supermarket_id).distinct()).all())
+
+def _get_all_users(session):
+    return [str(uid) for uid in session.scalars(select(Purchase.user_id).distinct()).all()]
+
+def _get_all_products(session):
+    return list(session.scalars(select(Product)).all())
+
+def _create_purchase(session, created_at, supermarket_id: str, user_id, items_list, total_amount):
+    # Store UUID as string to avoid SQLite numeric coercion issues.
+    user_uuid = str(UUID(str(user_id)))
+    product_ids = [int(pid) for pid in items_list]
+    products = session.scalars(select(Product).where(Product.id.in_(product_ids))).all()
+    purchase = Purchase(
+        supermarket_id=supermarket_id,
+        created_at=created_at,
+        user_id=user_uuid,
+        products=list(products),
+        total_amount=total_amount,
+    )
+    session.add(purchase)
+    session.commit()
+    return purchase
+
+def _get_unique_buyers_count(session):
+    count = session.scalar(select(func.count(func.distinct(Purchase.user_id))))
+    return int(count or 0)
+
+def _get_loyal_buyers(session, min_purchases: int):
+    user_id_text = Purchase.user_id.cast(String)
+    purchase_count = func.count(Purchase.id).label("purchase_count")
+    stmt = (
+        select(user_id_text.label("user_id_str"), purchase_count)
+        .group_by(user_id_text)
+        .having(purchase_count >= min_purchases)
+        .order_by(purchase_count.desc(), user_id_text)
+    )
+    rows = session.execute(stmt).all()
+    return [
+        {"user_id": str(row.user_id_str), "purchase_count": int(row.purchase_count)}
+        for row in rows
+    ]
+
+def _get_top_products(session, limit: int):
+    if limit <= 0:
+        return []
+    times_sold = func.count(purchase_product.c.purchase_id)
+    stmt = (
+        select(Product.name.label("product_name"), times_sold.label("times_sold"))
+        .join(purchase_product, Product.id == purchase_product.c.product_id)
+        .group_by(Product.id, Product.name)
+        .order_by(times_sold.desc(), Product.name)
+    )
+    rows = session.execute(stmt).all()
+    if not rows:
+        return []
+    cutoff_index = min(limit, len(rows)) - 1
+    cutoff_value = rows[cutoff_index].times_sold
+    filtered = [row for row in rows if row.times_sold >= cutoff_value]
+    return [dict(row._mapping) for row in filtered]
+
+# Bind attributes to modules
+cashier_mod.Product = Product
+cashier_mod.Purchase = Purchase
+cashier_mod.UUID = UUID
+cashier_mod.get_all_supermarkets = _get_all_supermarkets
+cashier_mod.get_all_users = _get_all_users
+cashier_mod.get_all_products = _get_all_products
+cashier_mod.create_purchase = _create_purchase
+
+dashboard_mod.Product = Product
+dashboard_mod.purchase_product = purchase_product
+dashboard_mod.get_unique_buyers_count = _get_unique_buyers_count
+dashboard_mod.get_loyal_buyers = _get_loyal_buyers
+dashboard_mod.get_top_products = _get_top_products
+
+services_pkg.cashier_service = cashier_mod
+services_pkg.dashboard_service = dashboard_mod
+services_pkg.__all__ = ["cashier_service", "dashboard_service"]
+api_pkg.services = services_pkg
+
+sys.modules["api"] = api_pkg
+sys.modules["api.services"] = services_pkg
+sys.modules["api.services.cashier_service"] = cashier_mod
+sys.modules["api.services.dashboard_service"] = dashboard_mod
+
+
+@pytest.fixture()
+def session():
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, future=True)
+    with SessionLocal() as session:
+        yield session
+        session.rollback()
+    engine.dispose()
+
+
+@pytest.fixture()
+def products(session):
+    items = [
+        Product(name="Apples", unit_price=1.50),
+        Product(name="Bananas", unit_price=0.75),
+        Product(name="Carrots", unit_price=0.50),
+        Product(name="Dates", unit_price=2.00),
+        Product(name="Milk", unit_price=3.00),
+    ]
+    session.add_all(items)
+    session.commit()
+    return items
+
+
+===== FILE: ./api-service/tests/test_cashier_service.py =====
+from datetime import datetime, timezone
+from uuid import UUID
+
+from api.services import cashier_service
+from database.models import Product, Purchase
+
+USER_A = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1")
+USER_B = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbb2")
+USER_X = UUID("cccccccc-cccc-cccc-cccc-ccccccccccc3")
+
+
+def test_get_all_supermarkets_and_users(session, products):
+    now = datetime(2024, 2, 1, tzinfo=timezone.utc)
+    cashier_service.create_purchase(session, now, "S1", USER_A, [str(products[0].id)], 4)
+    cashier_service.create_purchase(session, now, "S2", USER_B, [str(products[1].id)], 6)
+    cashier_service.create_purchase(session, now, "S1", USER_B, [str(products[2].id)], 8)
+    session.commit()
+
+    assert set(cashier_service.get_all_supermarkets(session)) == {"S1", "S2"}
+    assert set(cashier_service.get_all_users(session)) == {str(USER_A), str(USER_B)}
+
+
+def test_get_all_products(session, products):
+    fetched = cashier_service.get_all_products(session)
+
+    assert {p.name for p in fetched} == {"Apples", "Bananas", "Carrots", "Dates"}
+    assert all(isinstance(p, Product) for p in fetched)
+
+
+def test_create_purchase_deduplicates_items(session, products):
+    now = datetime(2024, 3, 1, tzinfo=timezone.utc)
+    purchase = cashier_service.create_purchase(
+        session,
+        now,
+        "S1",
+        USER_X,
+        [str(products[0].id), str(products[0].id), str(products[1].id)],
+        total_amount=99.0,
+    )
+    session.commit()
+    session.refresh(purchase)
+
+    assert purchase.total_amount == 99.0
+    assert sorted(p.id for p in purchase.products) == [products[0].id, products[1].id]
+    assert session.get(Purchase, purchase.id) is not None
+
+
+===== FILE: ./api-service/tests/test_dashboard_service.py =====
+from datetime import datetime, timezone
+from uuid import UUID, uuid5, NAMESPACE_DNS
+
+from api.services import dashboard_service, cashier_service
+
+# Deterministic UUIDs for predictable ordering/assertions in tests
+LOYAL_BUYER_ID = UUID("11111111-1111-1111-1111-111111111111")
+STEADY_BUYER_ID = UUID("22222222-2222-2222-2222-222222222222")
+OCCASIONAL_BUYER_ID = UUID("33333333-3333-3333-3333-333333333333")
+
+
+def _record_sales(session, product, count: int, user_prefix: str = "user"):
+    """Create `count` purchases each containing the given product."""
+    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    for i in range(count):
+        cashier_service.create_purchase(
+            session=session,
+            created_at=now,
+            supermarket_id=f"store-{i % 2}",
+            user_id=uuid5(NAMESPACE_DNS, f"{user_prefix}-{i}"),
+            items_list=[str(product.id)],
+            total_amount=product.unit_price,
+        )
+
+
+def test_get_unique_buyers_count(session, products):
+    assert dashboard_service.get_unique_buyers_count(session) == 0
+
+    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    user_one = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    user_two = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+
+    cashier_service.create_purchase(session, now, "S1", user_one, [str(products[0].id)], 10)
+    cashier_service.create_purchase(session, now, "S1", user_one, [str(products[1].id)], 12)
+    cashier_service.create_purchase(session, now, "S2", user_two, [str(products[2].id)], 5)
+    session.commit()
+
+    assert dashboard_service.get_unique_buyers_count(session) == 2
+
+
+def test_get_loyal_buyers_sorted_and_threshold(session, products):
+    now = datetime(2024, 1, 2, tzinfo=timezone.utc)
+    for _ in range(3):
+        cashier_service.create_purchase(session, now, "S1", LOYAL_BUYER_ID, [str(products[0].id)], 5)
+    for _ in range(2):
+        cashier_service.create_purchase(session, now, "S2", STEADY_BUYER_ID, [str(products[1].id)], 7)
+    cashier_service.create_purchase(session, now, "S3", OCCASIONAL_BUYER_ID, [str(products[2].id)], 3)
+    session.commit()
+
+    result = dashboard_service.get_loyal_buyers(session, min_purchases=2)
+    assert result == [
+        {"user_id": str(LOYAL_BUYER_ID), "purchase_count": 3},
+        {"user_id": str(STEADY_BUYER_ID), "purchase_count": 2},
+    ]
+    assert dashboard_service.get_loyal_buyers(session, min_purchases=4) == []
+
+
+def test_get_top_products_includes_ties_at_limit_one(session, products):
+    _record_sales(session, products[0], count=3, user_prefix="apple")
+    _record_sales(session, products[1], count=3, user_prefix="banana")
+    _record_sales(session, products[2], count=1, user_prefix="carrot")
+    session.commit()
+
+    top = dashboard_service.get_top_products(session, limit=1)
+
+    assert len(top) == 2
+    assert {item["product_name"] for item in top} == {products[0].name, products[1].name}
+    assert all(item["times_sold"] == 3 for item in top)
+
+
+def test_get_top_products_returns_ties_beyond_limit(session, products):
+    _record_sales(session, products[0], count=3, user_prefix="apple")
+    _record_sales(session, products[1], count=2, user_prefix="banana")
+    _record_sales(session, products[2], count=2, user_prefix="carrot")
+    _record_sales(session, products[3], count=1, user_prefix="dates")
+    session.commit()
+
+    top = dashboard_service.get_top_products(session, limit=2)
+
+    assert [item["product_name"] for item in top] == [
+        products[0].name,
+        products[1].name,
+        products[2].name,
+    ]
+    assert [item["times_sold"] for item in top] == [3, 2, 2]
+
+
+def test_get_top_products_with_zero_limit_returns_empty(session):
+    assert dashboard_service.get_top_products(session, limit=0) == []
+
+
+def test_get_top_products_ties_extend_past_limit(session, products):
+    """When limit cuts through a tie, all tied products should be returned."""
+    _record_sales(session, products[0], count=5, user_prefix="p0")  # top seller
+    _record_sales(session, products[1], count=4, user_prefix="p1")
+    _record_sales(session, products[2], count=3, user_prefix="p2")
+    _record_sales(session, products[3], count=3, user_prefix="p3")
+    _record_sales(session, products[4], count=2, user_prefix="p4")
+    session.commit()
+
+    top = dashboard_service.get_top_products(session, limit=3)
+
+    # Expect 4 entries because positions 3 and 4 are tied on times_sold.
+    assert len(top) == 4
+    assert [item["product_name"] for item in top] == [
+        products[0].name,
+        products[1].name,
+        products[2].name,
+        products[3].name,
+    ]
+    assert [item["times_sold"] for item in top] == [5, 4, 3, 3]
+
+===== FILE: ./cashier-service/app/__init__.py =====
+from flask import Flask
+
+from icash_common import setup_logging, register_frontend
+
+
+def create_app():
+    setup_logging()
+    app = Flask(
+        __name__,
+        instance_relative_config=True,
+        template_folder="../templates",
+        static_folder="../static",
+    )
+
+    # Load base config
+    app.config.from_object("app.config.Config")
+    register_frontend(app)
+    return app
+
+
+===== FILE: ./cashier-service/app/config.py =====
+import os
+
+
+class Config:
+    CATALOG_URL = os.getenv(
+        "CATALOG_SERVICE_URL", "http://127.0.0.1:8001/cashier/users_orders_purchases"
+    )
+    CREATE_PURCHASE_URL = os.getenv(
+        "CREATE_PURCHASE_URL", "http://127.0.0.1:8001/cashier/create_purchase"
+    )
+
+
+===== FILE: ./cashier-service/app/services.py =====
+import logging
+from typing import Dict, List
+from uuid import uuid4
+
+import requests
+from flask import current_app
+
+log = logging.getLogger(__name__)
+
+def fetch_catalog() -> Dict[str, List]:
+    url = current_app.config.get("CATALOG_URL")
+    try:
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+        return {
+            "products": payload["products"],
+            "supermarkets": payload["supermarkets"],
+            "users": payload["users"],
+        }
+    except Exception as e:
+        log.error("Catalog service failed in use: %s", e)
+        raise e
+
+def create_purchase(is_new_user: bool, user_id: str|None, supermarket_id: str, item_list: list, total_amount: float) -> dict:
+    try:
+        payload = {
+            "supermarket_id": supermarket_id,
+            "user_id": user_id if not is_new_user and user_id else str(uuid4()),
+            "items_list": item_list,
+            "total_amount": total_amount,
+        }
+        url = current_app.config.get("CREATE_PURCHASE_URL")
+        response = requests.post(url, json=payload, timeout=60)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        log.error("Create purchase failed in use: %s", e)
+        raise e
+
+
+===== FILE: ./cashier-service/app/views.py =====
+from flask import render_template, request, flash, redirect, url_for
+from requests import RequestException
+
+from app.services import create_purchase, fetch_catalog
+
+def render_index(error=None, success=None, catalog=None):
+    """Centralized way to render the index page."""
+    if catalog is None:
+        try:
+            catalog = fetch_catalog()
+        except RequestException:
+            return render_template(
+                "index.html",
+                products=[],
+                supermarkets=[],
+                users=[],
+                error=error or "Failed to load data",
+            )
+
+    context = {
+        "products": catalog.get("products", []),
+        "supermarkets": catalog.get("supermarkets", []),
+        "users": catalog.get("users", []),
+    }
+
+    if error:
+        context["error"] = error
+    if success:
+        context["success"] = success
+
+    return render_template("index.html", **context)
+
+
+def register_routes(app):
+    @app.route("/", methods=["GET"])
+    def index():
+        return render_index()
+
+
+
+    @app.route("/make_purchase", methods=["POST"])
+    def make_purchase():
+        is_new_user = request.form.get("is_new_user") == '1'
+        supermarket_id = request.form.get("supermarket_id")
+        user_id = request.form.get("user_id")
+        item_list = request.form.getlist("item_list")
+        total_amount = request.form.get("total_amount", type=float)
+        try:
+            create_purchase(is_new_user, user_id, supermarket_id, item_list, total_amount)
+        except RequestException:
+            flash("Failed to create purchase", "error")
+            return redirect(url_for("index"))
+
+        flash("Purchase created successfully!", "success")
+        return redirect(url_for("index"))
+
+===== FILE: ./cashier-service/templates/index.html =====
+{% extends "base.html" %}
+{% block title %}iCash Cashier{% endblock %}
+{% block brand_url %}{{ url_for('index') }}{% endblock %}
+{% block brand_text %}iCash Cashier{% endblock %}
+{% block nav_links %}
+  <a class="nav-link {{ 'active' if request.endpoint == 'index' else '' }}" href="{{ url_for('index') }}">
+    <i class="bi bi-cart-plus"></i> New Purchase
+  </a>
+{% endblock %}
+{% block content %}
+  <section class="hero-card mb-4">
+    <div>
+      <p class="eyebrow mb-2">Cashier</p>
+      <h1 class="display-6 fw-semibold mb-2">Create a purchase</h1>
+      <p class="text-secondary mb-0">Select a store, choose products, and send a synthetic transaction into iCash.</p>
+      <div class="d-flex flex-wrap gap-2 mt-3 align-items-center">
+        <span class="pill light">
+          <i class="bi bi-boxes me-1"></i>
+          {{ products|length }} products
+        </span>
+        <span class="pill soft">
+          <i class="bi bi-shop me-1"></i>
+          {{ supermarkets|length }} supermarkets
+        </span>
+      </div>
+    </div>
+    <div class="spark"></div>
+  </section>
+    {% with errors = get_flashed_messages(category_filter=['error']) %}
+      {% if errors %}
+        {% for error in errors %}
+          <div class="alert alert-danger shadow-sm">{{ error }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    {% with successes = get_flashed_messages(category_filter=['success']) %}
+      {% if successes %}
+        {% for success in successes %}
+          <div class="alert alert-success shadow-sm">{{ success }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+  {% if error %}
+    <div class="alert alert-danger shadow-sm">{{ error }}</div>
+  {% endif %}
+  {% if success %}
+    <div class="alert alert-success shadow-sm">{{ success }}</div>
+  {% endif %}
+  {% if total_amount is defined %}
+    <div class="alert alert-info shadow-sm">Submitted total: ${{ '%.2f'|format(total_amount) }}</div>
+  {% endif %}
+  {% if api_response %}
+    <pre class="p-3 mb-4">{{ api_response | tojson(indent=2) }}</pre>
+  {% endif %}
+
+  <div class="panel-card mb-4">
+    <div class="d-flex justify-content-between align-items-start mb-3">
+      <div>
+        <p class="label mb-1">Purchase details</p>
+        <p class="text-secondary small mb-0">Pick a supermarket, buyer, and the items you want to include.</p>
+      </div>
+    </div>
+
+    <form method="post" action="{{ url_for('make_purchase') }}">
+      <div class="row g-3 mb-3">
+        <div class="col-md-4">
+          <label class="form-label">Supermarket</label>
+          <select name="supermarket_id" class="form-select" required>
+            <option value="" disabled selected>Select...</option>
+            {% for sm in supermarkets %}
+              <option value="{{ sm }}">{{ sm }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-md-8">
+          <label class="form-label d-block">Customer</label>
+          <div class="d-flex flex-wrap align-items-center gap-3">
+            <div class="form-check">
+              <input class="form-check-input"
+                     type="radio"
+                     name="is_new_user"
+                     id="guest"
+                     value="1"
+                     checked>
+              <label class="form-check-label" for="guest">New user</label>
+            </div>
+            <div class="form-check">
+              <input class="form-check-input"
+                     type="radio"
+                     name="is_new_user"
+                     id="existing"
+                     value="0">
+              <label class="form-check-label" for="existing">Existing</label>
+            </div>
+            <select name="user_id" class="form-select w-auto">
+              {% for user in users %}
+                <option value="{{ user }}">{{ user }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="table-responsive mb-3">
+        <table class="table table-borderless align-middle custom-table">
+          <thead>
+          <tr>
+            <th>Select</th>
+            <th>Product</th>
+            <th class="text-end">Unit price</th>
+          </tr>
+          </thead>
+          <tbody>
+          {% for product in products %}
+            <tr>
+              <td>
+                <input class="form-check-input item-check"
+                       type="checkbox"
+                       name="item_list"
+                       value="{{ product.id }}"
+                       data-price="{{ '%.2f'|format(product.unit_price) }}">
+              </td>
+              <td>{{ product.name }}</td>
+              <td class="text-end fw-semibold">${{ '%.2f'|format(product.unit_price) }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="live-total alert d-flex justify-content-between align-items-center" id="live-total">
+        <span class="fw-semibold">Selected total</span>
+        <span class="stat-value small-text">$<span id="live-total-value">0.00</span></span>
+      </div>
+      <input type="hidden" name="total_amount" id="total_amount" value="0.00">
+      <div class="d-flex justify-content-end mt-3">
+        <button type="submit" class="btn btn-success d-inline-flex align-items-center gap-2">
+          <i class="bi bi-send"></i>
+          Submit purchase
+        </button>
+      </div>
+    </form>
+  </div>
+
+  <script>
+    (() => {
+      const checks = document.querySelectorAll('.item-check');
+      const totalEl = document.getElementById('live-total-value');
+      const totalInput = document.getElementById('total_amount');
+
+      const update = () => {
+        let total = 0;
+        checks.forEach(cb => {
+          if (cb.checked) total += parseFloat(cb.dataset.price);
+        });
+        const formatted = total.toFixed(2);
+        totalEl.textContent = formatted;
+        totalInput.value = formatted;
+      };
+      checks.forEach(cb => cb.addEventListener('change', update));
+      update();
+    })();
+  </script>
+{% endblock %}
+
+
+===== FILE: ./cashier-service/wsgi.py =====
+from app import create_app
+from app.views import register_routes
+
+app = create_app()
+register_routes(app)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000, debug=True)
+
+
+===== FILE: ./common/icash_common/__init__.py =====
+from .logging_config import setup_logging
+from .frontend import register_frontend, frontend_bp
+
+__all__ = ["setup_logging", "register_frontend", "frontend_bp"]
+
+
+===== FILE: ./common/icash_common/frontend.py =====
+"""Shared frontend assets (templates + static) for iCash services."""
+from flask import Blueprint
+
+frontend_bp = Blueprint(
+    "icash_common",
+    __name__,
+    template_folder="templates",
+    static_folder="static",
+    static_url_path="/common-static",
+)
+
+
+def register_frontend(app):
+    """Register the shared frontend blueprint on a Flask app."""
+    app.register_blueprint(frontend_bp)
+
+
+__all__ = ["frontend_bp", "register_frontend"]
+
+
+===== FILE: ./common/icash_common/logging_config.py =====
+# api/logging_config.py
+from logging.config import dictConfig
+import os
+
+def setup_logging() -> None:
+    """Configure application-wide logging to stdout"""
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    dictConfig({
+        'version': 1,
+        'disable_existing_loggers': False,  # <--- important
+        'formatters': {
+            'default': {
+                'format': '[%(asctime)s] %(levelname)s in %(module)s: %(message)s',
+            },
+        },
+        'handlers': {
+            'wsgi': {
+                'class': 'logging.StreamHandler',
+                'stream': 'ext://flask.logging.wsgi_errors_stream',
+                'formatter': 'default',
+            },
+        },
+        'root': {
+            'level': log_level,
+            'handlers': ['wsgi'],
+        },
+    })
+
+===== FILE: ./common/icash_common/static/styles.css =====
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+:root,
+html {
+  --bg: #f7f9fc;
+  --bg-2: #eef2f7;
+  --panel: rgba(255, 255, 255, 0.9);
+  --panel-border: #e5e7ef;
+  --text: #0f172a;
+  --muted: #607094;
+  --primary: #22c55e;
+  --primary-strong: #16a34a;
+  --accent: #38bdf8;
+  --amber: #f97316;
+  --shadow: 0 18px 48px rgba(15, 23, 42, 0.1);
+  --accent-rgb: 56, 189, 248;
+  --amber-rgb: 249, 115, 22;
+  --pill-bg: rgba(15, 23, 42, 0.06);
+  --pill-border: #d8deeb;
+  --pill-text: #0f172a;
+  --pill-subtle-bg: rgba(56, 189, 248, 0.14);
+  --pill-subtle-text: #0f172a;
+  --pill-light-bg: rgba(34, 197, 94, 0.16);
+  --pill-light-text: #0f172a;
+  --pill-soft-bg: rgba(15, 23, 42, 0.04);
+  --pill-id-bg: rgba(56, 189, 248, 0.18);
+  --pill-id-text: #0b172a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]),
+  html:not([data-theme]) {
+    --bg: #0b1021;
+    --bg-2: #0f172a;
+    --panel: rgba(255, 255, 255, 0.04);
+    --panel-border: rgba(255, 255, 255, 0.08);
+    --text: #e8edf8;
+    --muted: #9fb1d3;
+    --shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+    --pill-bg: rgba(255, 255, 255, 0.06);
+    --pill-border: rgba(255, 255, 255, 0.12);
+    --pill-text: #e8edf8;
+    --pill-subtle-bg: rgba(56, 189, 248, 0.12);
+    --pill-subtle-text: #e0f5ff;
+    --pill-light-bg: rgba(34, 197, 94, 0.12);
+    --pill-light-text: #d1fadf;
+    --pill-soft-bg: rgba(255, 255, 255, 0.05);
+    --pill-id-bg: rgba(56, 189, 248, 0.2);
+    --pill-id-text: #dff6ff;
+  }
+}
+
+:root[data-theme="dark"],
+html[data-theme="dark"],
+body[data-theme="dark"] {
+  --bg: #0b1021;
+  --bg-2: #0f172a;
+  --panel: rgba(255, 255, 255, 0.04);
+  --panel-border: rgba(255, 255, 255, 0.08);
+  --text: #e8edf8;
+  --muted: #9fb1d3;
+  --shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+  --pill-bg: rgba(255, 255, 255, 0.06);
+  --pill-border: rgba(255, 255, 255, 0.12);
+  --pill-text: #e8edf8;
+  --pill-subtle-bg: rgba(56, 189, 248, 0.12);
+  --pill-subtle-text: #e0f5ff;
+  --pill-light-bg: rgba(34, 197, 94, 0.12);
+  --pill-light-text: #d1fadf;
+  --pill-soft-bg: rgba(255, 255, 255, 0.05);
+  --pill-id-bg: rgba(56, 189, 248, 0.2);
+  --pill-id-text: #dff6ff;
+}
+
+:root[data-theme="light"],
+html[data-theme="light"],
+body[data-theme="light"] {
+  --bg: #f7f9fc;
+  --bg-2: #eef2f7;
+  --panel: rgba(255, 255, 255, 0.9);
+  --panel-border: #e5e7ef;
+  --text: #0f172a;
+  --muted: #607094;
+  --shadow: 0 18px 48px rgba(15, 23, 42, 0.1);
+  --pill-bg: rgba(15, 23, 42, 0.06);
+  --pill-border: #d8deeb;
+  --pill-text: #0f172a;
+  --pill-subtle-bg: rgba(56, 189, 248, 0.14);
+  --pill-subtle-text: #0f172a;
+  --pill-light-bg: rgba(34, 197, 94, 0.16);
+  --pill-light-text: #0f172a;
+  --pill-soft-bg: rgba(15, 23, 42, 0.04);
+  --pill-id-bg: rgba(56, 189, 248, 0.18);
+  --pill-id-text: #0b172a;
+}
+
+body {
+  font-family: 'Inter', -apple-system, system-ui, sans-serif;
+  background: radial-gradient(circle at 20% 20%, rgba(var(--accent-rgb), 0.16), transparent 32%),
+              radial-gradient(circle at 80% 0%, rgba(var(--amber-rgb), 0.14), transparent 28%),
+              linear-gradient(135deg, var(--bg) 0%, var(--bg-2) 100%);
+  color: var(--text);
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app-shell {
+  position: relative;
+  overflow-x: hidden;
+}
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: radial-gradient(700px at 15% 20%, rgba(56, 189, 248, 0.12), transparent 40%),
+              radial-gradient(900px at 80% 0%, rgba(250, 204, 21, 0.08), transparent 40%);
+  z-index: -2;
+}
+
+.backdrop.gradient {
+  background: linear-gradient(120deg, rgba(34, 197, 94, 0.04), rgba(56, 189, 248, 0.04));
+  z-index: -3;
+}
+
+.app-nav {
+  background: var(--panel);
+  backdrop-filter: blur(16px);
+  border-bottom: 1px solid var(--panel-border);
+  transition: background 150ms ease, border-color 150ms ease;
+}
+
+.navbar-brand {
+  color: var(--text) !important;
+}
+
+.navbar .nav-link {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.navbar .nav-link.active {
+  color: var(--text);
+}
+
+.navbar .nav-link i {
+  margin-right: 6px;
+}
+
+.brand-mark {
+  width: 12px;
+  height: 12px;
+  background: linear-gradient(135deg, var(--primary), var(--accent));
+  border-radius: 4px;
+  box-shadow: 0 6px 18px rgba(34, 197, 94, 0.5);
+}
+
+.container {
+  max-width: 1100px;
+}
+
+.hero-card {
+  position: relative;
+  padding: 28px;
+  border-radius: 18px;
+  background: linear-gradient(120deg, rgba(34, 197, 94, 0.12), rgba(56, 189, 248, 0.12));
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.hero-card .spark {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(500px at 85% 15%, rgba(250, 204, 21, 0.2), transparent 40%);
+  pointer-events: none;
+}
+
+.eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-weight: 600;
+  color: var(--amber);
+  font-size: 0.8rem;
+}
+
+.label {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.panel-card {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 16px;
+  padding: 18px;
+  box-shadow: var(--shadow);
+  transition: transform 120ms ease, border-color 120ms ease;
+}
+
+.panel-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(56, 189, 248, 0.3);
+}
+
+.stat-value {
+  font-size: 2.2rem;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1.1;
+}
+
+.stat-value.small-text {
+  font-size: 1.4rem;
+}
+
+.stat-hint {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.icon-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  border: 1px solid var(--panel-border);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--pill-border);
+  color: var(--pill-text);
+  background: var(--pill-bg);
+  font-weight: 500;
+  font-size: 0.95rem;
+}
+
+.pill.subtle {
+  background: var(--pill-subtle-bg);
+  color: var(--pill-subtle-text);
+}
+
+.pill.light {
+  background: var(--pill-light-bg);
+  color: var(--pill-light-text);
+}
+
+.pill.soft {
+  background: var(--pill-soft-bg);
+  color: var(--pill-text);
+}
+
+.pill.id-pill {
+  background: var(--pill-id-bg);
+  color: var(--pill-id-text);
+  border-color: rgba(var(--accent-rgb), 0.35);
+  font-family: monospace;
+}
+
+.custom-table thead th {
+  color: var(--muted);
+  font-weight: 600;
+  border: none;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.8rem;
+}
+
+.custom-table tbody td {
+  color: var(--text);
+  border-top: 1px solid var(--panel-border);
+}
+
+.custom-table tbody tr:hover td {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.table > :not(caption) > * > * {
+  background-color: transparent;
+}
+
+.text-secondary {
+  color: var(--muted) !important;
+}
+
+code {
+  font-size: 0.9rem;
+  color: #dff6ff;
+}
+
+pre {
+  background: rgba(15, 23, 42, 0.24);
+  color: #e8edf8;
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+}
+
+.alert {
+  border-radius: 12px;
+  border: 1px solid var(--panel-border);
+}
+
+.btn-outline-theme {
+  color: var(--text);
+  border-color: var(--panel-border);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.btn-outline-theme:hover,
+.btn-outline-theme:focus {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--accent);
+}
+
+.dropdown-menu {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  color: var(--text);
+}
+
+.dropdown-item {
+  color: var(--text);
+}
+
+.dropdown-item:active,
+.dropdown-item:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+}
+
+form .form-control,
+form .form-select {
+  border-radius: 12px;
+  border-color: var(--panel-border);
+}
+
+.live-total {
+  border: 1px dashed var(--panel-border);
+  background: rgba(56, 189, 248, 0.08);
+  border-radius: 12px;
+}
+
+.table caption {
+  color: var(--muted);
+}
+
+
+===== FILE: ./common/icash_common/templates/base.html =====
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}iCash{% endblock %}</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css">
+  <link rel="stylesheet" href="{{ url_for('icash_common.static', filename='styles.css') }}">
+  <script>
+    (() => {
+      const root = document.documentElement;
+      const body = document.body;
+      const set = (val) => {
+        if (val === 'light' || val === 'dark') {
+          root.setAttribute('data-theme', val);
+          root.setAttribute('data-bs-theme', val);
+          body?.setAttribute('data-theme', val);
+        } else {
+          root.removeAttribute('data-theme');
+          root.removeAttribute('data-bs-theme');
+          body?.removeAttribute('data-theme');
+        }
+      };
+
+      try {
+        const stored = localStorage.getItem('theme');
+        set(stored);
+      } catch (err) {
+        set(null);
+      }
+    })();
+  </script>
+</head>
+<body class="app-shell">
+  <div class="backdrop"></div>
+  <div class="backdrop gradient"></div>
+
+  <nav class="navbar navbar-expand-lg shadow-sm sticky-top app-nav">
+    <div class="container">
+      <a class="navbar-brand d-flex align-items-center gap-2" href="{% block brand_url %}{{ url_for('index') }}{% endblock %}">
+        <span class="brand-mark"></span>
+        <span class="fw-semibold">{% block brand_text %}iCash{% endblock %}</span>
+      </a>
+      <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#nav" aria-controls="nav" aria-expanded="false" aria-label="Toggle navigation">
+        <span class="navbar-toggler-icon"></span>
+      </button>
+      <div class="collapse navbar-collapse" id="nav">
+        <div class="ms-auto navbar-nav align-items-lg-center gap-lg-2">
+          {% block nav_links %}{% endblock %}
+          <div class="dropdown ms-lg-2">
+            <button class="btn btn-sm btn-outline-theme dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+              <i class="bi bi-circle-half"></i>
+              Theme
+            </button>
+            <ul class="dropdown-menu dropdown-menu-end">
+              <li><button class="dropdown-item" data-set-theme="light"><i class="bi bi-brightness-high me-2"></i>Light</button></li>
+              <li><button class="dropdown-item" data-set-theme="dark"><i class="bi bi-moon-stars me-2"></i>Dark</button></li>
+              <li><button class="dropdown-item" data-set-theme="system"><i class="bi bi-laptop me-2"></i>System</button></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <main class="container py-4 position-relative">
+    {% block content %}{% endblock %}
+  </main>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js" integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI" crossorigin="anonymous"></script>
+  <script>
+    (() => {
+      const root = document.documentElement;
+      const body = document.body;
+      const items = document.querySelectorAll('[data-set-theme]');
+      const system = window.matchMedia('(prefers-color-scheme: dark)');
+
+      function setThemeAttribute(value) {
+        if (value === 'light' || value === 'dark') {
+          root.setAttribute('data-theme', value);
+          root.setAttribute('data-bs-theme', value);
+          body.setAttribute('data-theme', value);
+        } else {
+          root.removeAttribute('data-theme');
+          root.removeAttribute('data-bs-theme');
+          body.removeAttribute('data-theme');
+        }
+      }
+
+      function applyTheme(choice) {
+        setThemeAttribute(choice);
+        try {
+          if (choice === 'light' || choice === 'dark') {
+            localStorage.setItem('theme', choice);
+          } else {
+            localStorage.removeItem('theme');
+          }
+        } catch (err) {
+          /* storage might be blocked; ignore */
+        }
+      }
+
+      items.forEach(item => {
+        item.addEventListener('click', (e) => {
+          applyTheme(e.currentTarget.dataset.setTheme);
+        });
+      });
+
+      system.addEventListener('change', () => {
+        const stored = (() => {
+          try { return localStorage.getItem('theme'); } catch (err) { return null; }
+        })();
+        if (!stored) {
+          setThemeAttribute(system.matches ? 'dark' : 'light');
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
+
+
+===== FILE: ./dashboard-service/app/__init__.py =====
+from flask import Flask
+from icash_common import setup_logging, register_frontend
+
+def create_app():
+    setup_logging()
+    app = Flask(
+        __name__,
+        instance_relative_config=True,
+        template_folder="../templates",
+        static_folder="../static",
+    )
+
+    app.config.from_object("app.config.Config")
+    register_frontend(app)
+    return app
+
+
+===== FILE: ./dashboard-service/app/config.py =====
+import os
+
+
+class Config:
+    ANALYTICS_URL = os.getenv(
+        "ANALYTICS_URL", "http://127.0.0.1:8001/dashboard/analytics"
+    )
+    MIN_PURCHASES = int(os.getenv("MIN_PURCHASES", 3))
+
+
+===== FILE: ./dashboard-service/app/services.py =====
+import logging
+from typing import Any, Dict
+
+import requests
+from flask import current_app
+
+logger = logging.getLogger(__name__)
+
+
+def fetch_analytics(min_purchases: int) -> Dict[str, Any]:
+    """Fetch analytics snapshot from the API service."""
+    url = current_app.config.get("ANALYTICS_URL")
+    params = {"min_purchases": min_purchases}
+
+    response = requests.get(url, params=params, timeout=60)
+    response.raise_for_status()
+    return response.json()
+
+
+===== FILE: ./dashboard-service/app/views.py =====
+from datetime import datetime
+
+from flask import render_template
+from requests import RequestException
+
+from app.config import Config
+from app.services import fetch_analytics
+
+
+def register_routes(app):
+    @app.route("/", methods=["GET"])
+    def dashboard():
+        analytics = {}
+        error = None
+
+        try:
+            analytics = fetch_analytics(min_purchases=Config.MIN_PURCHASES)
+        except RequestException:
+            error = "Failed to load analytics"
+
+        generated_at_str = analytics.get("generated_at")
+
+        generated_at = (
+            datetime.fromisoformat(generated_at_str)
+            if generated_at_str is not None
+            else None
+        )
+
+        return render_template(
+            "dashboard.html",
+            generated_at=generated_at,
+            analytics=analytics,
+            error=error,
+            min_purchases=Config.MIN_PURCHASES,
+        )
+
+
+===== FILE: ./dashboard-service/templates/dashboard.html =====
+{% extends "base.html" %}
+{% block title %}Owner Dashboard{% endblock %}
+{% block brand_url %}{{ url_for('dashboard') }}{% endblock %}
+{% block brand_text %}iCash Owner{% endblock %}
+{% block nav_links %}
+  <a class="nav-link active" aria-current="page" href="{{ url_for('dashboard') }}">
+    <i class="bi bi-grid"></i> Overview
+  </a>
+{% endblock %}
+{% block content %}
+  <section class="hero-card mb-4">
+    <div>
+      <p class="eyebrow mb-2">Live network</p>
+      <h1 class="display-6 fw-semibold mb-2">Owner Dashboard</h1>
+      <p class="text-secondary mb-0">Track unique buyers, celebrate your loyal customers, and keep an eye on the products that win.</p>
+      <div class="d-flex flex-wrap gap-2 mt-3 align-items-center">
+        {% if generated_at %}
+        <span class="pill subtle">
+          <i class="bi bi-clock-history me-1"></i>
+            Updated {{ generated_at.strftime('%Y-%m-%d %H:%M:%S') }}
+        </span>
+        {% endif %}
+        <span class="pill light">Min purchases threshold: {{ min_purchases }}</span>
+      </div>
+    </div>
+    <div class="spark"></div>
+  </section>
+
+  {% if error %}
+    <div class="alert alert-danger shadow-sm">{{ error }}</div>
+  {% endif %}
+
+  <section class="row g-3 mb-4">
+    <div class="col-12">
+      <div class="panel-card h-100">
+        <div class="d-flex align-items-start justify-content-between">
+          <div>
+            <p class="label mb-1">Unique buyers</p>
+            <div class="stat-value">{{ analytics.unique_buyers or 0 }}</div>
+            <p class="stat-hint">Across the entire iCash network.</p>
+          </div>
+          <span class="icon-pill bg-primary-subtle text-primary"><i class="bi bi-people-fill"></i></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="row g-3 mb-4">
+    <div class="col-12 col-lg-5">
+      <div class="panel-card h-100">
+        <div class="d-flex justify-content-between align-items-start mb-3">
+          <div>
+            <p class="label mb-1">Top products</p>
+            <p class="text-secondary small mb-0">Up to three products, extended to include ties.</p>
+          </div>
+          <span class="pill soft">All time</span>
+        </div>
+        <div class="table-responsive">
+          <table class="table table-borderless align-middle mb-0 custom-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Product</th>
+                <th class="text-end">Times sold</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% if analytics.top_products %}
+                {% for item in analytics.top_products %}
+                  <tr>
+                    <td class="text-secondary">{{ loop.index }}</td>
+                    <td>{{ item.name }}</td>
+                    <td class="text-end fw-semibold">{{ item.times_sold }}</td>
+                  </tr>
+                {% endfor %}
+              {% else %}
+                <tr>
+                  <td colspan="3" class="text-secondary">No sales data yet.</td>
+                </tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="col-12 col-lg-7">
+      <div class="panel-card h-100">
+        <div class="d-flex justify-content-between align-items-start mb-3">
+          <div>
+            <p class="label mb-1">Loyal buyers</p>
+            <p class="text-secondary small mb-0">Customers with at least {{ min_purchases }} purchases.</p>
+          </div>
+          <span class="pill soft">{{ analytics.loyal_buyers|length if analytics.loyal_buyers else 0 }} customers</span>
+        </div>
+        <div class="table-responsive">
+          <table class="table table-borderless align-middle mb-0 custom-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>User ID</th>
+                <th class="text-end">Purchases</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% if analytics.loyal_buyers %}
+                {% for buyer in analytics.loyal_buyers %}
+                  <tr>
+                    <td class="text-secondary">{{ loop.index }}</td>
+                    <td><span class="pill id-pill">{{ buyer.user_id }}</span></td>
+                    <td class="text-end fw-semibold">{{ buyer.purchase_count }}</td>
+                  </tr>
+                {% endfor %}
+              {% else %}
+                <tr>
+                  <td colspan="3" class="text-secondary">No loyal buyers yet.</td>
+                </tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}
+
+
+===== FILE: ./dashboard-service/wsgi.py =====
+from app import create_app
+from app.views import register_routes
+
+app = create_app()
+register_routes(app)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8002, debug=True)
+
+

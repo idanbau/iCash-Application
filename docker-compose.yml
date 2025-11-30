@@ -1,0 +1,58 @@
+services:
+
+  db:
+    image: postgres:18-alpine
+    container_name: icash-db
+    environment:
+      - POSTGRES_DB=icash
+      - POSTGRES_USER=icash
+      - POSTGRES_PASSWORD=icash
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: on-failure:3
+
+  api:
+    build:
+      context: .
+      dockerfile: api-service/Dockerfile
+    container_name: icash-api
+    expose:
+      - "8001"
+    environment:
+      - DATABASE_USERNAME=icash
+      - DATABASE_PASSWORD=icash
+      - DATABASE_HOST=db
+      - DATABASE_NAME=icash
+    restart: on-failure:3
+    depends_on:
+      - db
+
+  cashier:
+    build:
+      context: .
+      dockerfile: cashier-service/Dockerfile
+    container_name: icash-cashier
+    ports:
+      - "8000:8000"
+    environment:
+      - CATALOG_SERVICE_URL=http://api:8001/cashier/catalog
+      - CREATE_PURCHASE_URL=http://api:8001/cashier/create_purchase
+    depends_on:
+      - api
+    restart: on-failure:3
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard-service/Dockerfile
+    container_name: icash-dashboard
+    ports:
+      - "8002:8002"
+    environment:
+      - ANALYTICS_URL=http://api:8001/dashboard/analytics
+    depends_on:
+      - api
+    restart: on-failure:3
+
+volumes:
+  pgdata:

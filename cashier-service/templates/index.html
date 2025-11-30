@@ -1,0 +1,146 @@
+{% extends "base.html" %}
+{% block title %}iCash Cashier{% endblock %}
+{% block brand_url %}{{ url_for('index') }}{% endblock %}
+{% block brand_text %}iCash Cashier{% endblock %}
+{% block nav_links %}
+  <a class="nav-link {{ 'active' if request.endpoint == 'index' else '' }}" href="{{ url_for('index') }}">
+    <i class="bi bi-cart-plus"></i> New Purchase
+  </a>
+{% endblock %}
+{% block content %}
+  <section class="hero-card mb-4">
+    <div>
+      <p class="eyebrow mb-2">Cashier</p>
+      <h1 class="display-6 fw-semibold mb-2">Create a purchase</h1>
+      <p class="text-secondary mb-0">Select a store, choose products, and send a synthetic transaction into iCash.</p>
+      <div class="d-flex flex-wrap gap-2 mt-3 align-items-center">
+        <span class="pill light">
+          <i class="bi bi-boxes me-1"></i>
+          {{ products|length }} products
+        </span>
+        <span class="pill soft">
+          <i class="bi bi-shop me-1"></i>
+          {{ supermarkets|length }} supermarkets
+        </span>
+      </div>
+    </div>
+    <div class="spark"></div>
+  </section>
+  {% if error %}
+    <div class="alert alert-danger shadow-sm">{{ error }}</div>
+  {% endif %}
+  {% if success %}
+    <div class="alert alert-success shadow-sm">{{ success }}</div>
+  {% endif %}
+  {% if total_amount is defined %}
+    <div class="alert alert-info shadow-sm">Submitted total: ${{ '%.2f'|format(total_amount) }}</div>
+  {% endif %}
+  <div class="panel-card mb-4">
+    <div class="d-flex justify-content-between align-items-start mb-3">
+      <div>
+        <p class="label mb-1">Purchase details</p>
+        <p class="text-secondary small mb-0">Pick a supermarket, buyer, and the items you want to include.</p>
+      </div>
+    </div>
+
+    <form method="post" action="{{ url_for('make_purchase') }}">
+      <div class="row g-3 mb-3">
+        <div class="col-md-4">
+          <label class="form-label">Supermarket</label>
+          <select name="supermarket_id" class="form-select" required>
+            <option value="" disabled selected>Select...</option>
+            {% for sm in supermarkets %}
+              <option value="{{ sm }}">{{ sm }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-md-8">
+          <label class="form-label d-block">Customer</label>
+          <div class="d-flex flex-wrap align-items-center gap-3">
+            <div class="form-check">
+              <input class="form-check-input"
+                     type="radio"
+                     name="is_new_user"
+                     id="guest"
+                     value="1"
+                     checked>
+              <label class="form-check-label" for="guest">New user</label>
+            </div>
+            <div class="form-check">
+              <input class="form-check-input"
+                     type="radio"
+                     name="is_new_user"
+                     id="existing"
+                     value="0">
+              <label class="form-check-label" for="existing">Existing</label>
+            </div>
+            <select name="user_id" class="form-select w-auto">
+              {% for user in users %}
+                <option value="{{ user }}">{{ user }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="table-responsive mb-3">
+        <table class="table table-borderless align-middle custom-table">
+          <thead>
+          <tr>
+            <th>Select</th>
+            <th>Product</th>
+            <th class="text-end">Unit price</th>
+          </tr>
+          </thead>
+          <tbody>
+          {% for product in products %}
+            <tr>
+              <td>
+                <input class="form-check-input item-check"
+                       type="checkbox"
+                       name="item_list"
+                       value="{{ product.id }}"
+                       data-price="{{ '%.2f'|format(product.unit_price) }}">
+              </td>
+              <td>{{ product.name }}</td>
+              <td class="text-end fw-semibold">${{ '%.2f'|format(product.unit_price) }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="live-total alert d-flex justify-content-between align-items-center" id="live-total">
+        <span class="fw-semibold">Selected total</span>
+        <span class="stat-value small-text">$<span id="live-total-value">0.00</span></span>
+      </div>
+      <input type="hidden" name="total_amount" id="total_amount" value="0.00">
+      <div class="d-flex justify-content-end mt-3">
+        <button type="submit" class="btn btn-success d-inline-flex align-items-center gap-2">
+          <i class="bi bi-send"></i>
+          Submit purchase
+        </button>
+      </div>
+    </form>
+  </div>
+
+  <script>
+    (() => {
+      const checks = document.querySelectorAll('.item-check');
+      const totalEl = document.getElementById('live-total-value');
+      const totalInput = document.getElementById('total_amount');
+
+      const update = () => {
+        let total = 0;
+        checks.forEach(cb => {
+          if (cb.checked) total += parseFloat(cb.dataset.price);
+        });
+        const formatted = total.toFixed(2);
+        totalEl.textContent = formatted;
+        totalInput.value = formatted;
+      };
+      checks.forEach(cb => cb.addEventListener('change', update));
+      update();
+    })();
+  </script>
+{% endblock %}

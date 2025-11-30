@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}Owner Dashboard{% endblock %}
+{% block brand_url %}{{ url_for('dashboard') }}{% endblock %}
+{% block brand_text %}iCash Owner{% endblock %}
+{% block nav_links %}
+  <a class="nav-link active" aria-current="page" href="{{ url_for('dashboard') }}">
+    <i class="bi bi-grid"></i> Overview
+  </a>
+{% endblock %}
+{% block content %}
+  <section class="hero-card mb-4">
+    <div>
+      <p class="eyebrow mb-2">Live network</p>
+      <h1 class="display-6 fw-semibold mb-2">Owner Dashboard</h1>
+      <p class="text-secondary mb-0">Track unique buyers, celebrate your loyal customers, and keep an eye on the products that win.</p>
+      <div class="d-flex flex-wrap gap-2 mt-3 align-items-center">
+        {% if generated_at %}
+        <span class="pill subtle">
+          <i class="bi bi-clock-history me-1"></i>
+            Updated {{ generated_at.strftime('%Y-%m-%d %H:%M:%S') }}
+        </span>
+        {% endif %}
+        <span class="pill light">Min purchases threshold: {{ min_purchases }}</span>
+      </div>
+    </div>
+    <div class="spark"></div>
+  </section>
+
+  {% if error %}
+    <div class="alert alert-danger shadow-sm">{{ error }}</div>
+  {% endif %}
+
+  <section class="row g-3 mb-4">
+    <div class="col-12">
+      <div class="panel-card h-100">
+        <div class="d-flex align-items-start justify-content-between">
+          <div>
+            <p class="label mb-1">Unique buyers</p>
+            <div class="stat-value">{{ analytics.unique_buyers or 0 }}</div>
+            <p class="stat-hint">Across the entire iCash network.</p>
+          </div>
+          <span class="icon-pill bg-primary-subtle text-primary"><i class="bi bi-people-fill"></i></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="row g-3 mb-4">
+    <div class="col-12 col-lg-5">
+      <div class="panel-card h-100">
+        <div class="d-flex justify-content-between align-items-start mb-3">
+          <div>
+            <p class="label mb-1">Top products</p>
+            <p class="text-secondary small mb-0">Up to three products, extended to include ties.</p>
+          </div>
+          <span class="pill soft">All time</span>
+        </div>
+        <div class="table-responsive">
+          <table class="table table-borderless align-middle mb-0 custom-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Product</th>
+                <th class="text-end">Times sold</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% if analytics.top_products %}
+                {% for item in analytics.top_products %}
+                  <tr>
+                    <td class="text-secondary">{{ loop.index }}</td>
+                    <td>{{ item.name }}</td>
+                    <td class="text-end fw-semibold">{{ item.times_sold }}</td>
+                  </tr>
+                {% endfor %}
+              {% else %}
+                <tr>
+                  <td colspan="3" class="text-secondary">No sales data yet.</td>
+                </tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="col-12 col-lg-7">
+      <div class="panel-card h-100">
+        <div class="d-flex justify-content-between align-items-start mb-3">
+          <div>
+            <p class="label mb-1">Loyal buyers</p>
+            <p class="text-secondary small mb-0">Customers with at least {{ min_purchases }} purchases.</p>
+          </div>
+          <span class="pill soft">{{ analytics.loyal_buyers|length if analytics.loyal_buyers else 0 }} customers</span>
+        </div>
+        <div class="table-responsive">
+          <table class="table table-borderless align-middle mb-0 custom-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>User ID</th>
+                <th class="text-end">Purchases</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% if analytics.loyal_buyers %}
+                {% for buyer in analytics.loyal_buyers %}
+                  <tr>
+                    <td class="text-secondary">{{ loop.index }}</td>
+                    <td><span class="pill id-pill">{{ buyer.user_id }}</span></td>
+                    <td class="text-end fw-semibold">{{ buyer.purchase_count }}</td>
+                  </tr>
+                {% endfor %}
+              {% else %}
+                <tr>
+                  <td colspan="3" class="text-secondary">No loyal buyers yet.</td>
+                </tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

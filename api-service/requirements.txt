@@ -1,0 +1,7 @@
+pytest
+Flask==3.1.*
+SQLAlchemy==2.0.*
+gunicorn==23.*
+psycopg[binary]==3.2.*
+Flask-SQLAlchemy==3.1.*
+flask-caching==2.3.*

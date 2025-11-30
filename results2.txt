@@ -1,0 +1,212 @@
+Short answer:
+
+* **All real data (products, purchases, etc.) lives in `api-service` only.**
+* **`pos-service` and `dashboard-service` should call `api-service` over HTTP, not touch the DB directly.**
+* For your stack, using **Flask on the server side of `pos-service` / `dashboard-service` to call the API is usually the nicest pattern** (Backend-for-Frontend).
+* You only cache when it makes sense; you don’t create another “real” data store in the POS/Dashboard.
+
+Let’s break it down.
+
+---
+
+## 1. How should `pos-service` contact `api-service`?
+
+You have two main options:
+
+### Option A – Server-side Flask calls the API (recommended here)
+
+`pos-service` is a Flask app that:
+
+1. Receives a browser request.
+2. From inside Flask, calls `api-service` (using `requests` or similar).
+3. Renders a template / returns JSON to the browser.
+
+**Pros:**
+
+* No CORS headaches: traffic is browser → pos-service → api-service (internal).
+* You can keep `api-service` only visible on the Docker network, not publicly exposed.
+* Auth/session stays simple: browser has a cookie with `pos-service`, and `pos-service` talks to `api-service` with a service-to-service secret.
+* You can aggregate/transform data specifically for that UI without polluting the core API.
+
+**Example inside `pos-service` (Flask):**
+
+```python
+# pos-service/app/views.py
+import os
+import requests
+from flask import Blueprint, render_template
+
+bp = Blueprint('pos', __name__)
+
+API_BASE_URL = os.getenv('API_BASE_URL', 'http://api-service:8000')
+
+@bp.route('/products')
+def products():
+    resp = requests.get(f'{API_BASE_URL}/products')
+    resp.raise_for_status()
+    products = resp.json()
+    return render_template('products.html', products=products)
+```
+
+In `docker-compose.yml`, you’d typically have:
+
+```yaml
+services:
+  api-service:
+    build: ./api-service
+    container_name: api-service
+    # expose ports etc.
+
+  pos-service:
+    build: ./pos-service
+    environment:
+      - API_BASE_URL=http://api-service:8000
+    depends_on:
+      - api-service
+```
+
+Flask in `pos-service` talks to `http://api-service:8000` via Docker’s internal network.
+
+### Option B – Browser (JS) calls `api-service` directly
+
+Here, `pos-service` is mostly a static frontend (HTML/JS/CSS), and the JavaScript does:
+
+```js
+fetch('https://api.yourdomain.com/products')
+  .then(res => res.json())
+  .then(products => { /* render */ });
+```
+
+**Pros:**
+
+* Very simple mental model: frontend → API.
+* `pos-service` can even be just Nginx serving static files.
+
+**Cons:**
+
+* Need to manage CORS on your API.
+* Need token-based auth on the client, stored securely.
+* `api-service` must be public-facing (unless you do extra work with an API gateway).
+
+### So which should you pick?
+
+Given your layout (three Flask services, docker-compose, microservices feel):
+
+> **Use server-side Flask in `pos-service` and `dashboard-service` to talk to `api-service` (Option A).**
+
+That’s the classic **Backend-for-Frontend (BFF)** pattern:
+
+* `api-service` = core business logic + DB
+* `pos-service` = POS-specific backend + HTML/JS
+* `dashboard-service` = analytics/admin-specific backend + HTML/JS
+
+---
+
+## 2. Where should the data be stored?
+
+> **All canonical business data should live in `api-service`’s DB only.**
+
+Given your structure:
+
+* `api-service/db/` → this is the one and only **system-of-record** for:
+
+  * Products
+  * Purchases
+  * Customers, etc.
+
+`pos-service` and `dashboard-service` should **not** have their own copy of this same data (no copy-paste DB, no direct table access to `api-service`’s DB).
+
+**Best practice in microservices:**
+
+* *Each service owns its database.*
+* Other services talk to it **only via its API**, never by reaching into its DB schema.
+
+So:
+
+* `pos-service`:
+
+  * ✅ Can have its own DB for UI things (e.g., POS terminal config, UI preferences, local queues).
+  * ❌ Should not be the place where products / purchases are canonically stored.
+
+* `dashboard-service`:
+
+  * ✅ Can have its own DB for dashboard configs, user preferences, maybe precomputed aggregates.
+  * ❌ Should not be the canonical source of sales data.
+
+If later you want faster reporting, you might:
+
+* Have `dashboard-service` maintain a **read-only analytics store**, populated from events or batch jobs coming from `api-service`. But the **source of truth is still `api-service`**.
+
+---
+
+## 3. How often should data be updated? Every refresh?
+
+You don’t want “another DB” in POS/Dashboard to keep in sync on every refresh. Usually:
+
+### For POS UI
+
+* When a POS page loads (e.g. “Sell” screen):
+
+  * Fetch **products** from `api-service`.
+* When a sale is made:
+
+  * Send a **create purchase** request to `api-service`.
+  * Use the response to update the UI.
+
+Caching rules (rough guide):
+
+* **Products list**
+
+  * Typically changes infrequently.
+  * You can cache for a short time (e.g. 5–10 minutes) in:
+
+    * memory in the Flask app, or
+    * browser local storage, or
+    * a small Redis cache.
+  * Or just fetch on page load until performance becomes an issue.
+
+* **Purchases/orders**
+
+  * More dynamic. Usually you fetch:
+
+    * Latest purchases on page load.
+    * After certain actions (e.g. “Save sale”, “Refresh” button).
+  * You might use polling or WebSockets if you want near real-time updates across multiple terminals.
+
+**You do *not* need to sync an internal DB on every refresh** unless you’re explicitly building an offline-first POS.
+
+### For Dashboard
+
+The dashboard can:
+
+* Call API endpoints like `/stats/sales?from=2025-01-01&to=2025-01-31`.
+* Or get summarized data (if you add those endpoints).
+
+Again, the typical pattern:
+
+* Fetch data from `api-service` when the dashboard page loads, and maybe let the user hit “Refresh”.
+* Optionally cache results in `dashboard-service` for a short time if queries are heavy.
+
+---
+
+## Very short checklist
+
+**Architecture**
+
+* [x] `api-service` (Flask + SQLAlchemy + DB) = core API + business logic.
+* [x] `pos-service` (Flask) = BFF for POS; calls `api-service` via HTTP.
+* [x] `dashboard-service` (Flask) = BFF for dashboard; calls `api-service` via HTTP.
+* [x] No service reads/writes another service’s DB directly.
+
+**Data**
+
+* [x] Products/purchases only stored canonically in `api-service` DB.
+* [x] Other services only store their own auxiliary data or cache.
+
+**Updates**
+
+* [x] Fetch from API on page loads / user actions.
+* [x] Add caching where it makes sense (product catalog, heavy reports).
+* [x] Don’t maintain full duplicated data stores in POS/Dashboard unless you know you need offline or specialized analytics.
+
+If you like, next step I can sketch a minimal `docker-compose.yml` + a simple Flask `pos-service` that calls `api-service` so you can copy-paste it into your project.
